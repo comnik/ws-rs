@@ -6,7 +6,7 @@ use mio::Token;
 use mio_extras::timer::Timeout;
 use url;
 
-use io::ALL;
+// use io::ALL;
 use message;
 use protocol::CloseCode;
 use result::{Error, Result};
@@ -111,26 +111,26 @@ impl Sender {
             .map_err(Error::from)
     }
 
-    /// Send a message to the endpoints of all connections.
-    ///
-    /// Be careful with this method. It does not discriminate between client and server connections.
-    /// If your WebSocket is only functioning as a server, then usage is simple, this method will
-    /// send a copy of the message to each connected client. However, if you have a WebSocket that
-    /// is listening for connections and is also connected to another WebSocket, this method will
-    /// broadcast a copy of the message to all the clients connected and to that WebSocket server.
-    #[inline]
-    pub fn broadcast<M>(&self, msg: M) -> Result<()>
-    where
-        M: Into<message::Message>,
-    {
-        self.channel
-            .send(Command {
-                token: ALL,
-                signal: Signal::Message(msg.into()),
-                connection_id: self.connection_id,
-            })
-            .map_err(Error::from)
-    }
+    // /// Send a message to the endpoints of all connections.
+    // ///
+    // /// Be careful with this method. It does not discriminate between client and server connections.
+    // /// If your WebSocket is only functioning as a server, then usage is simple, this method will
+    // /// send a copy of the message to each connected client. However, if you have a WebSocket that
+    // /// is listening for connections and is also connected to another WebSocket, this method will
+    // /// broadcast a copy of the message to all the clients connected and to that WebSocket server.
+    // #[inline]
+    // pub fn broadcast<M>(&self, msg: M) -> Result<()>
+    // where
+    //     M: Into<message::Message>,
+    // {
+    //     self.channel
+    //         .send(Command {
+    //             token: ALL,
+    //             signal: Signal::Message(msg.into()),
+    //             connection_id: self.connection_id,
+    //         })
+    //         .map_err(Error::from)
+    // }
 
     /// Send a close code to the other endpoint.
     #[inline]

@@ -20,12 +20,12 @@ extern crate url;
 extern crate log;
 
 mod communication;
-mod connection;
+pub mod connection;
 mod factory;
 mod frame;
 mod handler;
 mod handshake;
-mod io;
+// mod io;
 mod message;
 mod protocol;
 mod result;
@@ -37,7 +37,7 @@ pub mod deflate;
 pub mod util;
 
 pub use factory::Factory;
-pub use handler::Handler;
+// pub use handler::Handler;
 
 pub use communication::Sender;
 pub use frame::Frame;
@@ -51,79 +51,6 @@ use std::borrow::Borrow;
 use std::default::Default;
 use std::fmt;
 use std::net::{SocketAddr, ToSocketAddrs};
-
-use mio::Poll;
-
-/// A utility function for setting up a WebSocket server.
-///
-/// # Safety
-///
-/// This function blocks until the event loop finishes running. Avoid calling this method within
-/// another WebSocket handler.
-///
-/// # Examples
-///
-/// ```no_run
-/// use ws::listen;
-///
-/// listen("127.0.0.1:3012", |out| {
-///     move |msg| {
-///        out.send(msg)
-///    }
-/// }).unwrap()
-/// ```
-///
-pub fn listen<A, F, H>(addr: A, factory: F) -> Result<()>
-where
-    A: ToSocketAddrs + fmt::Debug,
-    F: FnMut(Sender) -> H,
-    H: Handler,
-{
-    let ws = WebSocket::new(factory)?;
-    ws.listen(addr)?;
-    Ok(())
-}
-
-/// A utility function for setting up a WebSocket client.
-///
-/// # Safety
-///
-/// This function blocks until the event loop finishes running. Avoid calling this method within
-/// another WebSocket handler. If you need to establish a connection from inside of a handler,
-/// use the `connect` method on the Sender.
-///
-/// # Examples
-///
-/// ```no_run
-/// use ws::{connect, CloseCode};
-///
-/// connect("ws://127.0.0.1:3012", |out| {
-///     out.send("Hello WebSocket").unwrap();
-///
-///     move |msg| {
-///         println!("Got message: {}", msg);
-///         out.close(CloseCode::Normal)
-///     }
-/// }).unwrap()
-/// ```
-///
-pub fn connect<U, F, H>(url: U, factory: F) -> Result<()>
-where
-    U: Borrow<str>,
-    F: FnMut(Sender) -> H,
-    H: Handler,
-{
-    let mut ws = WebSocket::new(factory)?;
-    let parsed = url::Url::parse(url.borrow()).map_err(|err| {
-        Error::new(
-            ErrorKind::Internal,
-            format!("Unable to parse {} as url due to {:?}", url.borrow(), err),
-        )
-    })?;
-    ws.connect(parsed)?;
-    ws.run()?;
-    Ok(())
-}
 
 /// WebSocket settings
 #[derive(Debug, Clone, Copy)]
@@ -263,125 +190,5 @@ impl Default for Settings {
             encrypt_server: false,
             tcp_nodelay: false,
         }
-    }
-}
-
-/// The WebSocket struct. A WebSocket can support multiple incoming and outgoing connections.
-pub struct WebSocket<F>
-where
-    F: Factory,
-{
-    poll: Poll,
-    handler: io::Handler<F>,
-}
-
-impl<F> WebSocket<F>
-where
-    F: Factory,
-{
-    /// Create a new WebSocket using the given Factory to create handlers.
-    pub fn new(factory: F) -> Result<WebSocket<F>> {
-        Builder::new().build(factory)
-    }
-
-    /// Consume the WebSocket and bind to the specified address.
-    /// If the `addr_spec` yields multiple addresses this will return after the
-    /// first successful bind. `local_addr` can be called to determine which
-    /// address it ended up binding to.
-    /// After the server is successfully bound you should start it using `run`.
-    pub fn bind<A>(mut self, addr_spec: A) -> Result<WebSocket<F>>
-    where
-        A: ToSocketAddrs,
-    {
-        let mut last_error = Error::new(ErrorKind::Internal, "No address given");
-
-        for addr in addr_spec.to_socket_addrs()? {
-            if let Err(e) = self.handler.listen(&mut self.poll, &addr) {
-                error!("Unable to listen on {}", addr);
-                last_error = e;
-            } else {
-                let actual_addr = self.handler.local_addr().unwrap_or(addr);
-                info!("Listening for new connections on {}.", actual_addr);
-                return Ok(self);
-            }
-        }
-
-        Err(last_error)
-    }
-
-    /// Consume the WebSocket and listen for new connections on the specified address.
-    ///
-    /// # Safety
-    ///
-    /// This method will block until the event loop finishes running.
-    pub fn listen<A>(self, addr_spec: A) -> Result<WebSocket<F>>
-    where
-        A: ToSocketAddrs,
-    {
-        self.bind(addr_spec).and_then(|server| server.run())
-    }
-
-    /// Queue an outgoing connection on this WebSocket. This method may be called multiple times,
-    /// but the actual connections will not be established until `run` is called.
-    pub fn connect(&mut self, url: url::Url) -> Result<&mut WebSocket<F>> {
-        let sender = self.handler.sender();
-        info!("Queuing connection to {}", url);
-        sender.connect(url)?;
-        Ok(self)
-    }
-
-    /// Run the WebSocket. This will run the encapsulated event loop blocking the calling thread until
-    /// the WebSocket is shutdown.
-    pub fn run(mut self) -> Result<WebSocket<F>> {
-        self.handler.run(&mut self.poll)?;
-        Ok(self)
-    }
-
-    /// Get a Sender that can be used to send messages on all connections.
-    /// Calling `send` on this Sender is equivalent to calling `broadcast`.
-    /// Calling `shutdown` on this Sender will shutdown the WebSocket even if no connections have
-    /// been established.
-    #[inline]
-    pub fn broadcaster(&self) -> Sender {
-        self.handler.sender()
-    }
-
-    /// Get the local socket address this socket is bound to. Will return an error
-    /// if the backend returns an error. Will return a `NotFound` error if
-    /// this WebSocket is not a listening socket.
-    pub fn local_addr(&self) -> ::std::io::Result<SocketAddr> {
-        self.handler.local_addr()
-    }
-}
-
-/// Utility for constructing a WebSocket from various settings.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct Builder {
-    settings: Settings,
-}
-
-// TODO: add convenience methods for each setting
-impl Builder {
-    /// Create a new Builder with default settings.
-    pub fn new() -> Builder {
-        Builder::default()
-    }
-
-    /// Build a WebSocket using this builder and a factory.
-    /// It is possible to use the same builder to create multiple WebSockets.
-    pub fn build<F>(&self, factory: F) -> Result<WebSocket<F>>
-    where
-        F: Factory,
-    {
-        Ok(WebSocket {
-            poll: Poll::new()?,
-            handler: io::Handler::new(factory, self.settings),
-        })
-    }
-
-    /// Set the WebSocket settings to use.
-    pub fn with_settings(&mut self, settings: Settings) -> &mut Builder {
-        self.settings = settings;
-        self
     }
 }

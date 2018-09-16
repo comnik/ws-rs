@@ -16,7 +16,6 @@ use openssl::ssl::HandshakeError;
 use native_tls::HandshakeError;
 
 use frame::Frame;
-use handler::Handler;
 use handshake::{Handshake, Request, Response};
 use message::Message;
 use protocol::{CloseCode, OpCode};
@@ -48,6 +47,15 @@ pub enum Endpoint {
     Server,
 }
 
+/// High-level connection events
+#[derive(Debug, Clone)]
+pub enum ConnEvent {
+    NOOP,
+    Ping(Frame),
+    Pong,
+    Message(Message),
+}
+
 impl State {
     #[inline]
     pub fn is_connecting(&self) -> bool {
@@ -75,10 +83,7 @@ impl State {
     }
 }
 
-pub struct Connection<H>
-where
-    H: Handler,
-{
+pub struct Connection {
     token: Token,
     socket: Stream,
     state: State,
@@ -90,25 +95,19 @@ where
     in_buffer: Cursor<Vec<u8>>,
     out_buffer: Cursor<Vec<u8>>,
 
-    handler: H,
-
     addresses: Vec<SocketAddr>,
 
     settings: Settings,
     connection_id: u32,
 }
 
-impl<H> Connection<H>
-where
-    H: Handler,
-{
+impl Connection {
     pub fn new(
         tok: Token,
         sock: TcpStream,
-        handler: H,
         settings: Settings,
         connection_id: u32,
-    ) -> Connection<H> {
+    ) -> Connection {
         Connection {
             token: tok,
             socket: Stream::tcp(sock),
@@ -121,7 +120,6 @@ where
             fragments: VecDeque::with_capacity(settings.fragments_capacity),
             in_buffer: Cursor::new(Vec::with_capacity(settings.in_buffer_capacity)),
             out_buffer: Cursor::new(Vec::with_capacity(settings.out_buffer_capacity)),
-            handler,
             addresses: Vec::new(),
             settings,
             connection_id,
@@ -133,63 +131,63 @@ where
         Ok(())
     }
 
-    pub fn as_client(&mut self, url: url::Url, addrs: Vec<SocketAddr>) -> Result<()> {
-        if let Connecting(ref mut req_buf, _) = self.state {
-            let req = self.handler.build_request(&url)?;
-            self.addresses = addrs;
-            self.events.insert(Ready::writable());
-            self.endpoint = Endpoint::Client(url);
-            req.format(req_buf.get_mut())
-        } else {
-            Err(Error::new(
-                Kind::Internal,
-                "Tried to set connection to client while not connecting.",
-            ))
-        }
-    }
+    // pub fn as_client(&mut self, url: url::Url, addrs: Vec<SocketAddr>) -> Result<()> {
+    //     if let Connecting(ref mut req_buf, _) = self.state {
+    //         let req = self.handler.build_request(&url)?;
+    //         self.addresses = addrs;
+    //         self.events.insert(Ready::writable());
+    //         self.endpoint = Endpoint::Client(url);
+    //         req.format(req_buf.get_mut())
+    //     } else {
+    //         Err(Error::new(
+    //             Kind::Internal,
+    //             "Tried to set connection to client while not connecting.",
+    //         ))
+    //     }
+    // }
 
-    #[cfg(any(feature = "ssl", feature = "nativetls"))]
-    pub fn encrypt(&mut self) -> Result<()> {
-        let sock = self.socket().try_clone()?;
-        let ssl_stream = match self.endpoint {
-            Server => self.handler.upgrade_ssl_server(sock),
-            Client(ref url) => self.handler.upgrade_ssl_client(sock, url),
-        };
+    // #[cfg(any(feature = "ssl", feature = "nativetls"))]
+    // pub fn encrypt(&mut self) -> Result<()> {
+    //     let sock = self.socket().try_clone()?;
+    //     let ssl_stream = match self.endpoint {
+    //         Server => self.handler.upgrade_ssl_server(sock),
+    //         Client(ref url) => self.handler.upgrade_ssl_client(sock, url),
+    //     };
 
-        match ssl_stream {
-            Ok(stream) => {
-                self.socket = Stream::tls_live(stream);
-                Ok(())
-            }
-            #[cfg(feature = "ssl")]
-            Err(Error {
-                kind: Kind::SslHandshake(handshake_err),
-                details,
-            }) => match handshake_err {
-                HandshakeError::SetupFailure(_) => {
-                    Err(Error::new(Kind::SslHandshake(handshake_err), details))
-                }
-                HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
-                    self.socket = Stream::tls(mid);
-                    Ok(())
-                }
-            },
-            #[cfg(feature = "nativetls")]
-            Err(Error {
-                kind: Kind::SslHandshake(handshake_err),
-                details,
-            }) => match handshake_err {
-                HandshakeError::Failure(_) => {
-                    Err(Error::new(Kind::SslHandshake(handshake_err), details))
-                }
-                HandshakeError::Interrupted(mid) => {
-                    self.socket = Stream::tls(mid);
-                    Ok(())
-                }
-            },
-            Err(e) => Err(e),
-        }
-    }
+    //     match ssl_stream {
+    //         Ok(stream) => {
+    //             self.socket = Stream::tls_live(stream);
+    //             Ok(())
+    //         }
+    //         #[cfg(feature = "ssl")]
+    //         Err(Error {
+    //             kind: Kind::SslHandshake(handshake_err),
+    //             details,
+    //         }) => match handshake_err {
+    //             HandshakeError::SetupFailure(_) => {
+    //                 Err(Error::new(Kind::SslHandshake(handshake_err), details))
+    //             }
+    //             HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
+    //                 self.socket = Stream::tls(mid);
+    //                 Ok(())
+    //             }
+    //         },
+    //         #[cfg(feature = "nativetls")]
+    //         Err(Error {
+    //             kind: Kind::SslHandshake(handshake_err),
+    //             details,
+    //         }) => match handshake_err {
+    //             HandshakeError::Failure(_) => {
+    //                 Err(Error::new(Kind::SslHandshake(handshake_err), details))
+    //             }
+    //             HandshakeError::Interrupted(mid) => {
+    //                 self.socket = Stream::tls(mid);
+    //                 Ok(())
+    //             }
+    //         },
+    //         Err(e) => Err(e),
+    //     }
+    // }
 
     pub fn token(&self) -> Token {
         self.token
@@ -212,109 +210,109 @@ where
     }
 
     // Resetting may be necessary in order to try all possible addresses for a server
-    #[cfg(any(feature = "ssl", feature = "nativetls"))]
-    pub fn reset(&mut self) -> Result<()> {
-        // if self.is_client() {
-        if let Client(ref url) = self.endpoint {
-            if let Connecting(ref mut req, ref mut res) = self.state {
-                req.set_position(0);
-                res.set_position(0);
-                self.events.remove(Ready::readable());
-                self.events.insert(Ready::writable());
+    // #[cfg(any(feature = "ssl", feature = "nativetls"))]
+    // pub fn reset(&mut self) -> Result<()> {
+    //     // if self.is_client() {
+    //     if let Client(ref url) = self.endpoint {
+    //         if let Connecting(ref mut req, ref mut res) = self.state {
+    //             req.set_position(0);
+    //             res.set_position(0);
+    //             self.events.remove(Ready::readable());
+    //             self.events.insert(Ready::writable());
 
-                if let Some(ref addr) = self.addresses.pop() {
-                    let sock = TcpStream::connect(addr)?;
-                    if self.socket.is_tls() {
-                        let ssl_stream = self.handler.upgrade_ssl_client(sock, url);
-                        match ssl_stream {
-                            Ok(stream) => {
-                                self.socket = Stream::tls_live(stream);
-                                Ok(())
-                            }
-                            #[cfg(feature = "ssl")]
-                            Err(Error {
-                                kind: Kind::SslHandshake(handshake_err),
-                                details,
-                            }) => match handshake_err {
-                                HandshakeError::SetupFailure(_) => {
-                                    Err(Error::new(Kind::SslHandshake(handshake_err), details))
-                                }
-                                HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
-                                    self.socket = Stream::tls(mid);
-                                    Ok(())
-                                }
-                            },
-                            #[cfg(feature = "nativetls")]
-                            Err(Error {
-                                kind: Kind::SslHandshake(handshake_err),
-                                details,
-                            }) => match handshake_err {
-                                HandshakeError::Failure(_) => {
-                                    Err(Error::new(Kind::SslHandshake(handshake_err), details))
-                                }
-                                HandshakeError::Interrupted(mid) => {
-                                    self.socket = Stream::tls(mid);
-                                    Ok(())
-                                }
-                            },
-                            Err(e) => Err(e),
-                        }
-                    } else {
-                        self.socket = Stream::tcp(sock);
-                        Ok(())
-                    }
-                } else {
-                    if self.settings.panic_on_new_connection {
-                        panic!("Unable to connect to server.");
-                    }
-                    Err(Error::new(Kind::Internal, "Exhausted possible addresses."))
-                }
-            } else {
-                Err(Error::new(
-                    Kind::Internal,
-                    "Unable to reset client connection because it is active.",
-                ))
-            }
-        } else {
-            Err(Error::new(
-                Kind::Internal,
-                "Server connections cannot be reset.",
-            ))
-        }
-    }
+    //             if let Some(ref addr) = self.addresses.pop() {
+    //                 let sock = TcpStream::connect(addr)?;
+    //                 if self.socket.is_tls() {
+    //                     let ssl_stream = self.handler.upgrade_ssl_client(sock, url);
+    //                     match ssl_stream {
+    //                         Ok(stream) => {
+    //                             self.socket = Stream::tls_live(stream);
+    //                             Ok(())
+    //                         }
+    //                         #[cfg(feature = "ssl")]
+    //                         Err(Error {
+    //                             kind: Kind::SslHandshake(handshake_err),
+    //                             details,
+    //                         }) => match handshake_err {
+    //                             HandshakeError::SetupFailure(_) => {
+    //                                 Err(Error::new(Kind::SslHandshake(handshake_err), details))
+    //                             }
+    //                             HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
+    //                                 self.socket = Stream::tls(mid);
+    //                                 Ok(())
+    //                             }
+    //                         },
+    //                         #[cfg(feature = "nativetls")]
+    //                         Err(Error {
+    //                             kind: Kind::SslHandshake(handshake_err),
+    //                             details,
+    //                         }) => match handshake_err {
+    //                             HandshakeError::Failure(_) => {
+    //                                 Err(Error::new(Kind::SslHandshake(handshake_err), details))
+    //                             }
+    //                             HandshakeError::Interrupted(mid) => {
+    //                                 self.socket = Stream::tls(mid);
+    //                                 Ok(())
+    //                             }
+    //                         },
+    //                         Err(e) => Err(e),
+    //                     }
+    //                 } else {
+    //                     self.socket = Stream::tcp(sock);
+    //                     Ok(())
+    //                 }
+    //             } else {
+    //                 if self.settings.panic_on_new_connection {
+    //                     panic!("Unable to connect to server.");
+    //                 }
+    //                 Err(Error::new(Kind::Internal, "Exhausted possible addresses."))
+    //             }
+    //         } else {
+    //             Err(Error::new(
+    //                 Kind::Internal,
+    //                 "Unable to reset client connection because it is active.",
+    //             ))
+    //         }
+    //     } else {
+    //         Err(Error::new(
+    //             Kind::Internal,
+    //             "Server connections cannot be reset.",
+    //         ))
+    //     }
+    // }
 
-    #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
-    pub fn reset(&mut self) -> Result<()> {
-        if self.is_client() {
-            if let Connecting(ref mut req, ref mut res) = self.state {
-                req.set_position(0);
-                res.set_position(0);
-                self.events.remove(Ready::readable());
-                self.events.insert(Ready::writable());
+    // #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
+    // pub fn reset(&mut self) -> Result<()> {
+    //     if self.is_client() {
+    //         if let Connecting(ref mut req, ref mut res) = self.state {
+    //             req.set_position(0);
+    //             res.set_position(0);
+    //             self.events.remove(Ready::readable());
+    //             self.events.insert(Ready::writable());
 
-                if let Some(ref addr) = self.addresses.pop() {
-                    let sock = TcpStream::connect(addr)?;
-                    self.socket = Stream::tcp(sock);
-                    Ok(())
-                } else {
-                    if self.settings.panic_on_new_connection {
-                        panic!("Unable to connect to server.");
-                    }
-                    Err(Error::new(Kind::Internal, "Exhausted possible addresses."))
-                }
-            } else {
-                Err(Error::new(
-                    Kind::Internal,
-                    "Unable to reset client connection because it is active.",
-                ))
-            }
-        } else {
-            Err(Error::new(
-                Kind::Internal,
-                "Server connections cannot be reset.",
-            ))
-        }
-    }
+    //             if let Some(ref addr) = self.addresses.pop() {
+    //                 let sock = TcpStream::connect(addr)?;
+    //                 self.socket = Stream::tcp(sock);
+    //                 Ok(())
+    //             } else {
+    //                 if self.settings.panic_on_new_connection {
+    //                     panic!("Unable to connect to server.");
+    //                 }
+    //                 Err(Error::new(Kind::Internal, "Exhausted possible addresses."))
+    //             }
+    //         } else {
+    //             Err(Error::new(
+    //                 Kind::Internal,
+    //                 "Unable to reset client connection because it is active.",
+    //             ))
+    //         }
+    //     } else {
+    //         Err(Error::new(
+    //             Kind::Internal,
+    //             "Server connections cannot be reset.",
+    //         ))
+    //     }
+    // }
 
     pub fn events(&self) -> Ready {
         self.events
@@ -334,45 +332,37 @@ where
         }
     }
 
-    pub fn shutdown(&mut self) {
-        self.handler.on_shutdown();
-        if let Err(err) = self.send_close(CloseCode::Away, "Shutting down.") {
-            self.handler.on_error(err);
-            self.disconnect()
-        }
-    }
+    // pub fn shutdown(&mut self) {
+    //     self.handler.on_shutdown();
+    //     if let Err(err) = self.send_close(CloseCode::Away, "Shutting down.") {
+    //         self.handler.on_error(err);
+    //         self.disconnect()
+    //     }
+    // }
 
-    #[inline]
-    pub fn new_timeout(&mut self, event: Token, timeout: Timeout) -> Result<()> {
-        self.handler.on_new_timeout(event, timeout)
-    }
+    // #[inline]
+    // pub fn new_timeout(&mut self, event: Token, timeout: Timeout) -> Result<()> {
+    //     self.handler.on_new_timeout(event, timeout)
+    // }
 
-    #[inline]
-    pub fn timeout_triggered(&mut self, event: Token) -> Result<()> {
-        self.handler.on_timeout(event)
-    }
+    // #[inline]
+    // pub fn timeout_triggered(&mut self, event: Token) -> Result<()> {
+    //     self.handler.on_timeout(event)
+    // }
 
     pub fn error(&mut self, err: Error) {
         match self.state {
             Connecting(_, ref mut res) => match err.kind {
                 #[cfg(feature = "ssl")]
-                Kind::Ssl(_) => {
-                    self.handler.on_error(err);
-                    self.events = Ready::empty();
-                }
-                Kind::Io(_) => {
-                    self.handler.on_error(err);
-                    self.events = Ready::empty();
-                }
+                Kind::Ssl(_) => { self.events = Ready::empty(); }
+                Kind::Io(_) => { self.events = Ready::empty(); }
                 Kind::Protocol => {
                     let msg = err.to_string();
-                    self.handler.on_error(err);
                     if let Server = self.endpoint {
                         res.get_mut().clear();
                         if let Err(err) =
                             write!(res.get_mut(), "HTTP/1.1 400 Bad Request\r\n\r\n{}", msg)
                         {
-                            self.handler.on_error(Error::from(err));
                             self.events = Ready::empty();
                         } else {
                             self.events.remove(Ready::readable());
@@ -384,7 +374,6 @@ where
                 }
                 _ => {
                     let msg = err.to_string();
-                    self.handler.on_error(err);
                     if let Server = self.endpoint {
                         res.get_mut().clear();
                         if let Err(err) = write!(
@@ -392,7 +381,6 @@ where
                             "HTTP/1.1 500 Internal Server Error\r\n\r\n{}",
                             msg
                         ) {
-                            self.handler.on_error(Error::from(err));
                             self.events = Ready::empty();
                         } else {
                             self.events.remove(Ready::readable());
@@ -411,9 +399,7 @@ where
                         }
                         let reason = format!("{}", err);
 
-                        self.handler.on_error(err);
                         if let Err(err) = self.send_close(CloseCode::Error, reason) {
-                            self.handler.on_error(err);
                             self.disconnect()
                         }
                     }
@@ -423,9 +409,7 @@ where
                         }
                         let reason = format!("{}", err);
 
-                        self.handler.on_error(err);
                         if let Err(err) = self.send_close(CloseCode::Size, reason) {
-                            self.handler.on_error(err);
                             self.disconnect()
                         }
                     }
@@ -435,9 +419,7 @@ where
                         }
                         let reason = format!("{}", err);
 
-                        self.handler.on_error(err);
                         if let Err(err) = self.send_close(CloseCode::Protocol, reason) {
-                            self.handler.on_error(err);
                             self.disconnect()
                         }
                     }
@@ -447,32 +429,25 @@ where
                         }
                         let reason = format!("{}", err);
 
-                        self.handler.on_error(err);
                         if let Err(err) = self.send_close(CloseCode::Invalid, reason) {
-                            self.handler.on_error(err);
                             self.disconnect()
                         }
                     }
                     Kind::Http(_) => {
                         // This may happen if some handler writes a bad response
-                        self.handler.on_error(err);
                         error!("Disconnecting WebSocket.");
                         self.disconnect()
                     }
-                    Kind::Custom(_) => {
-                        self.handler.on_error(err);
-                    }
+                    Kind::Custom(_) => { }
                     Kind::Queue(_) => {
                         if self.settings.panic_on_queue {
                             panic!("Panicking on queue error -- {}", err);
                         }
-                        self.handler.on_error(err);
                     }
                     _ => {
                         if self.settings.panic_on_io {
                             panic!("Panicking on io error -- {}", err);
                         }
-                        self.handler.on_error(err);
                         self.disconnect()
                     }
                 }
@@ -484,17 +459,17 @@ where
         match self.state {
             RespondingClose | FinishedClose | Connecting(_, _) => (),
             _ => {
-                self.handler.on_close(CloseCode::Abnormal, "");
+                // self.handler.on_close(CloseCode::Abnormal, "");
             }
         }
         self.events = Ready::empty()
     }
 
-    pub fn consume(self) -> H {
-        self.handler
-    }
+    // pub fn consume(self) -> H {
+    //     self.handler
+    // }
 
-    fn write_handshake(&mut self) -> Result<()> {
+    fn write_handshake(&mut self) -> Result<Vec<ConnEvent>> {
         if let Connecting(ref mut req, ref mut res) = self.state {
             match self.endpoint {
                 Server => {
@@ -505,7 +480,7 @@ where
                         }
                     }
                     if !done {
-                        return Ok(());
+                        return Ok(Vec::new());
                     }
                 }
                 Client(_) => {
@@ -522,7 +497,7 @@ where
                             self.events.remove(Ready::writable());
                         }
                     }
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
             }
         }
@@ -540,7 +515,7 @@ where
                     // parse. We don't call disconnect here because `on_open` hasn't been called yet.
                     self.state = FinishedClose;
                     self.events = Ready::empty();
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
             };
 
@@ -553,18 +528,18 @@ where
 
             if response.status() != 101 {
                 self.events = Ready::empty();
-                return Ok(());
+                return Ok(Vec::new());
             } else {
-                self.handler.on_open(Handshake {
-                    request,
-                    response,
-                    peer_addr: self.socket.peer_addr().ok(),
-                    local_addr: self.socket.local_addr().ok(),
-                })?;
+                // self.handler.on_open(Handshake {
+                //     request,
+                //     response,
+                //     peer_addr: self.socket.peer_addr().ok(),
+                //     local_addr: self.socket.local_addr().ok(),
+                // })?;
                 debug!("Connection to {} is now open.", self.peer_addr());
                 self.events.insert(Ready::readable());
                 self.check_events();
-                return Ok(());
+                return Ok(Vec::new());
             }
         } else {
             Err(Error::new(
@@ -574,42 +549,42 @@ where
         }
     }
 
-    fn read_handshake(&mut self) -> Result<()> {
+    fn read_handshake(&mut self) -> Result<Vec<ConnEvent>> {
         if let Connecting(ref mut req, ref mut res) = self.state {
             match self.endpoint {
                 Server => {
                     if let Some(read) = self.socket.try_read_buf(req.get_mut())? {
                         if read == 0 {
                             self.events = Ready::empty();
-                            return Ok(());
+                            return Ok(Vec::new());
                         }
                         if let Some(ref request) = Request::parse(req.get_ref())? {
                             trace!("Handshake request received: \n{}", request);
-                            let response = self.handler.on_request(request)?;
+                            let response = Response::from_request(request).unwrap();
                             response.format(res.get_mut())?;
                             self.events.remove(Ready::readable());
                             self.events.insert(Ready::writable());
                         }
                     }
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
                 Client(_) => {
-                    if self.socket.try_read_buf(res.get_mut())?.is_some() {
-                        // TODO: see if this can be optimized with drain
-                        let end = {
-                            let data = res.get_ref();
-                            let end = data.iter()
-                                .enumerate()
-                                .take_while(|&(ind, _)| !data[..ind].ends_with(b"\r\n\r\n"))
-                                .count();
-                            if !data[..end].ends_with(b"\r\n\r\n") {
-                                return Ok(());
-                            }
-                            self.in_buffer.get_mut().extend(&data[end..]);
-                            end
-                        };
-                        res.get_mut().truncate(end);
-                    }
+                    // if self.socket.try_read_buf(res.get_mut())?.is_some() {
+                    //     // TODO: see if this can be optimized with drain
+                    //     let end = {
+                    //         let data = res.get_ref();
+                    //         let end = data.iter()
+                    //             .enumerate()
+                    //             .take_while(|&(ind, _)| !data[..ind].ends_with(b"\r\n\r\n"))
+                    //             .count();
+                    //         if !data[..end].ends_with(b"\r\n\r\n") {
+                    //             return Ok(ConnEvent::NOOP);
+                    //         }
+                    //         self.in_buffer.get_mut().extend(&data[end..]);
+                    //         end
+                    //     };
+                    //     res.get_mut().truncate(end);
+                    // }
                 }
             }
         }
@@ -640,7 +615,7 @@ where
                 if response.status() != 301 && response.status() != 302 {
                     return Err(Error::new(Kind::Protocol, "Handshake failed."));
                 } else {
-                    return Ok(());
+                    return Ok(Vec::new());
                 }
             }
 
@@ -658,21 +633,23 @@ where
                 }
             }
 
-            self.handler.on_response(&response)?;
-            self.handler.on_open(Handshake {
-                request,
-                response,
-                peer_addr: self.socket.peer_addr().ok(),
-                local_addr: self.socket.local_addr().ok(),
-            })?;
+            // self.handler.on_response(&response)?;
+            // self.handler.on_open(Handshake {
+            //     request,
+            //     response,
+            //     peer_addr: self.socket.peer_addr().ok(),
+            //     local_addr: self.socket.local_addr().ok(),
+            // })?;
 
             // check to see if there is anything to read already
-            if !self.in_buffer.get_ref().is_empty() {
-                self.read_frames()?;
-            }
+            let conn_events = if !self.in_buffer.get_ref().is_empty() {
+                self.read_frames().unwrap()
+            } else {
+                Vec::new()
+            };
 
             self.check_events();
-            return Ok(());
+            return Ok(conn_events);
         }
         Err(Error::new(
             Kind::Internal,
@@ -680,7 +657,7 @@ where
         ))
     }
 
-    pub fn read(&mut self) -> Result<()> {
+    pub fn read(&mut self) -> Result<Vec<ConnEvent>> {
         if self.socket.is_negotiating() {
             trace!("Performing TLS negotiation on {}.", self.peer_addr());
             self.socket.clear_negotiating()?;
@@ -690,9 +667,14 @@ where
                 trace!("Ready to read handshake from {}.", self.peer_addr());
                 self.read_handshake()
             } else {
+                let mut conn_events = Vec::with_capacity(8);
+                
                 trace!("Ready to read messages from {}.", self.peer_addr());
                 while let Some(len) = self.buffer_in()? {
-                    self.read_frames()?;
+                    match self.read_frames() {
+                        Err(err) => panic!(err),
+                        Ok(mut events) => conn_events.append(&mut events),
+                    }
                     if len == 0 {
                         if self.events.is_writable() {
                             self.events.remove(Ready::readable());
@@ -702,7 +684,8 @@ where
                         break;
                     }
                 }
-                Ok(())
+                
+                Ok(conn_events)
             };
 
             if self.socket.is_negotiating() && res.is_ok() {
@@ -713,7 +696,10 @@ where
         }
     }
 
-    fn read_frames(&mut self) -> Result<()> {
+    fn read_frames(&mut self) -> Result<Vec<ConnEvent>> {
+
+        let mut conn_events = Vec::with_capacity(2);
+        
         while let Some(mut frame) = Frame::parse(&mut self.in_buffer)? {
             match self.state {
                 // Ignore data received after receiving close frame
@@ -741,230 +727,232 @@ where
 
             // This is safe whether or not a frame is masked.
             frame.remove_mask();
-
-            if let Some(frame) = self.handler.on_frame(frame)? {
-                if frame.is_final() {
-                    match frame.opcode() {
-                        // singleton data frames
-                        OpCode::Text => {
-                            trace!("Received text frame {:?}", frame);
-                            // since we are going to handle this, there can't be an ongoing
-                            // message
-                            if !self.fragments.is_empty() {
-                                return Err(Error::new(Kind::Protocol, "Received unfragmented text frame while processing fragmented message."));
-                            }
+            // default implementation doesn't allow for reserved bits to be set
+            if frame.has_rsv1() || frame.has_rsv2() || frame.has_rsv3() {
+                panic!(Error::new(Kind::Protocol, "Encountered frame with reserved bits set."));
+            } else if frame.is_final() {
+                match frame.opcode() {
+                    // singleton data frames
+                    OpCode::Text => {
+                        trace!("Received text frame {:?}", frame);
+                        // since we are going to handle this, there can't be an ongoing
+                        // message
+                        if !self.fragments.is_empty() {
+                            return Err(Error::new(Kind::Protocol, "Received unfragmented text frame while processing fragmented message."));
+                        } else {
                             let msg = Message::text(String::from_utf8(frame.into_data())
-                                .map_err(|err| err.utf8_error())?);
-                            self.handler.on_message(msg)?;
+                                                    .map_err(|err| err.utf8_error())?);
+                            conn_events.push(ConnEvent::Message(msg));
                         }
-                        OpCode::Binary => {
-                            trace!("Received binary frame {:?}", frame);
-                            // since we are going to handle this, there can't be an ongoing
-                            // message
-                            if !self.fragments.is_empty() {
-                                return Err(Error::new(Kind::Protocol, "Received unfragmented binary frame while processing fragmented message."));
-                            }
-                            let data = frame.into_data();
-                            self.handler.on_message(Message::binary(data))?;
+                    }
+                    OpCode::Binary => {
+                        trace!("Received binary frame {:?}", frame);
+                        // since we are going to handle this, there can't be an ongoing
+                        // message
+                        if !self.fragments.is_empty() {
+                            return Err(Error::new(Kind::Protocol, "Received unfragmented binary frame while processing fragmented message."));
                         }
-                        // control frames
-                        OpCode::Close => {
-                            trace!("Received close frame {:?}", frame);
-                            // Closing handshake
-                            if self.state.is_closing() {
-                                if self.is_server() {
-                                    // Finished handshake, disconnect server side
-                                    self.events = Ready::empty()
-                                } else {
-                                    // We are a client, so we wait for the server to close the
-                                    // connection
-                                }
+                        let data = frame.into_data();
+                        // self.handler.on_message(Message::binary(data))?;
+                        conn_events.push(ConnEvent::Message(Message::binary(data)));
+                    }
+                    // control frames
+                    OpCode::Close => {
+                        trace!("Received close frame {:?}", frame);
+                        // Closing handshake
+                        if self.state.is_closing() {
+                            if self.is_server() {
+                                // Finished handshake, disconnect server side
+                                self.events = Ready::empty()
                             } else {
-                                // Starting handshake, will send the responding close frame
-                                self.state = RespondingClose;
+                                // We are a client, so we wait for the server to close the
+                                // connection
                             }
+                        } else {
+                            // Starting handshake, will send the responding close frame
+                            self.state = RespondingClose;
+                        }
 
-                            let mut close_code = [0u8; 2];
-                            let mut data = Cursor::new(frame.into_data());
-                            if let 2 = data.read(&mut close_code)? {
-                                let raw_code: u16 =
-                                    (u16::from(close_code[0]) << 8) | (u16::from(close_code[1]));
-                                trace!(
-                                    "Connection to {} received raw close code: {:?}, {:?}",
-                                    self.peer_addr(),
-                                    raw_code,
-                                    close_code
-                                );
-                                let named = CloseCode::from(raw_code);
-                                if let CloseCode::Other(code) = named {
-                                    if code < 1000 ||
-                                            code >= 5000 ||
-                                            code == 1004 ||
-                                            code == 1014 ||
-                                            code == 1016 || // these below are here to pass the autobahn test suite
-                                            code == 1100 || // we shouldn't need them later
-                                            code == 2000
-                                        || code == 2999
-                                    {
-                                        return Err(Error::new(
-                                            Kind::Protocol,
-                                            format!(
-                                                "Received invalid close code from endpoint: {}",
-                                                code
-                                            ),
-                                        ));
-                                    }
+                        let mut close_code = [0u8; 2];
+                        let mut data = Cursor::new(frame.into_data());
+                        if let 2 = data.read(&mut close_code)? {
+                            let raw_code: u16 =
+                                (u16::from(close_code[0]) << 8) | (u16::from(close_code[1]));
+                            trace!(
+                                "Connection to {} received raw close code: {:?}, {:?}",
+                                self.peer_addr(),
+                                raw_code,
+                                close_code
+                            );
+                            let named = CloseCode::from(raw_code);
+                            if let CloseCode::Other(code) = named {
+                                if code < 1000 ||
+                                    code >= 5000 ||
+                                    code == 1004 ||
+                                    code == 1014 ||
+                                    code == 1016 || // these below are here to pass the autobahn test suite
+                                    code == 1100 || // we shouldn't need them later
+                                    code == 2000 ||
+                                    code == 2999
+                                {
+                                    return Err(Error::new(
+                                        Kind::Protocol,
+                                        format!(
+                                            "Received invalid close code from endpoint: {}",
+                                            code
+                                        ),
+                                    ));
                                 }
-                                let has_reason = {
-                                    if let Ok(reason) = from_utf8(&data.get_ref()[2..]) {
-                                        self.handler.on_close(named, reason); // note reason may be an empty string
-                                        true
-                                    } else {
-                                        self.handler.on_close(named, "");
-                                        false
-                                    }
-                                };
-
-                                if let CloseCode::Abnormal = named {
-                                    return Err(Error::new(
-                                        Kind::Protocol,
-                                        "Received abnormal close code from endpoint.",
-                                    ));
-                                } else if let CloseCode::Status = named {
-                                    return Err(Error::new(
-                                        Kind::Protocol,
-                                        "Received no status close code from endpoint.",
-                                    ));
-                                } else if let CloseCode::Restart = named {
-                                    return Err(Error::new(
-                                        Kind::Protocol,
-                                        "Restart close code is not supported.",
-                                    ));
-                                } else if let CloseCode::Again = named {
-                                    return Err(Error::new(
-                                        Kind::Protocol,
-                                        "Try again later close code is not supported.",
-                                    ));
-                                } else if let CloseCode::Tls = named {
-                                    return Err(Error::new(
-                                        Kind::Protocol,
-                                        "Received TLS close code outside of TLS handshake.",
-                                    ));
+                            }
+                            let has_reason = {
+                                if let Ok(reason) = from_utf8(&data.get_ref()[2..]) {
+                                    // self.handler.on_close(named, reason); // note reason may be an empty string
+                                    true
                                 } else {
-                                    if !self.state.is_closing() {
-                                        if has_reason {
-                                            self.send_close(named, "")?; // note this drops any extra close data
-                                        } else {
-                                            self.send_close(CloseCode::Invalid, "")?;
-                                        }
-                                    } else {
-                                        self.state = FinishedClose;
-                                    }
+                                    // self.handler.on_close(named, "");
+                                    false
                                 }
+                            };
+
+                            if let CloseCode::Abnormal = named {
+                                return Err(Error::new(
+                                    Kind::Protocol,
+                                    "Received abnormal close code from endpoint.",
+                                ));
+                            } else if let CloseCode::Status = named {
+                                return Err(Error::new(
+                                    Kind::Protocol,
+                                    "Received no status close code from endpoint.",
+                                ));
+                            } else if let CloseCode::Restart = named {
+                                return Err(Error::new(
+                                    Kind::Protocol,
+                                    "Restart close code is not supported.",
+                                ));
+                            } else if let CloseCode::Again = named {
+                                return Err(Error::new(
+                                    Kind::Protocol,
+                                    "Try again later close code is not supported.",
+                                ));
+                            } else if let CloseCode::Tls = named {
+                                return Err(Error::new(
+                                    Kind::Protocol,
+                                    "Received TLS close code outside of TLS handshake.",
+                                ));
                             } else {
-                                // This is not an error. It is allowed behavior in the
-                                // protocol, so we don't trigger an error.
-                                // "If there is no such data in the Close control frame,
-                                // _The WebSocket Connection Close Reason_ is the empty string."
-                                self.handler.on_close(CloseCode::Status, "");
                                 if !self.state.is_closing() {
-                                    self.send_close(CloseCode::Empty, "")?;
+                                    if has_reason {
+                                        self.send_close(named, "")?; // note this drops any extra close data
+                                    } else {
+                                        self.send_close(CloseCode::Invalid, "")?;
+                                    }
                                 } else {
                                     self.state = FinishedClose;
                                 }
                             }
-                        }
-                        OpCode::Ping => {
-                            trace!("Received ping frame {:?}", frame);
-                            self.send_pong(frame.into_data())?;
-                        }
-                        OpCode::Pong => {
-                            trace!("Received pong frame {:?}", frame);
-                            // no ping validation for now
-                        }
-                        // last fragment
-                        OpCode::Continue => {
-                            trace!("Received final fragment {:?}", frame);
-                            if let Some(first) = self.fragments.pop_front() {
-                                let size = self.fragments.iter().fold(
-                                    first.payload().len() + frame.payload().len(),
-                                    |len, frame| len + frame.payload().len(),
-                                );
-                                match first.opcode() {
-                                    OpCode::Text => {
-                                        trace!("Constructing text message from fragments: {:?} -> {:?} -> {:?}", first, self.fragments.iter().collect::<Vec<&Frame>>(), frame);
-                                        let mut data = Vec::with_capacity(size);
-                                        data.extend(first.into_data());
-                                        while let Some(frame) = self.fragments.pop_front() {
-                                            data.extend(frame.into_data());
-                                        }
-                                        data.extend(frame.into_data());
-
-                                        let string = String::from_utf8(data)
-                                            .map_err(|err| err.utf8_error())?;
-
-                                        trace!(
-                                            "Calling handler with constructed message: {:?}",
-                                            string
-                                        );
-                                        self.handler.on_message(Message::text(string))?;
-                                    }
-                                    OpCode::Binary => {
-                                        trace!("Constructing binary message from fragments: {:?} -> {:?} -> {:?}", first, self.fragments.iter().collect::<Vec<&Frame>>(), frame);
-                                        let mut data = Vec::with_capacity(size);
-                                        data.extend(first.into_data());
-
-                                        while let Some(frame) = self.fragments.pop_front() {
-                                            data.extend(frame.into_data());
-                                        }
-
-                                        data.extend(frame.into_data());
-
-                                        trace!(
-                                            "Calling handler with constructed message: {:?}",
-                                            data
-                                        );
-                                        self.handler.on_message(Message::binary(data))?;
-                                    }
-                                    _ => {
-                                        return Err(Error::new(
-                                            Kind::Protocol,
-                                            "Encounted fragmented control frame.",
-                                        ))
-                                    }
-                                }
+                        } else {
+                            // This is not an error. It is allowed behavior in the
+                            // protocol, so we don't trigger an error.
+                            // "If there is no such data in the Close control frame,
+                            // _The WebSocket Connection Close Reason_ is the empty string."
+                            // self.handler.on_close(CloseCode::Status, "");
+                            if !self.state.is_closing() {
+                                self.send_close(CloseCode::Empty, "")?;
                             } else {
-                                return Err(Error::new(
-                                    Kind::Protocol,
-                                    "Unable to reconstruct fragmented message. No first frame.",
-                                ));
+                                self.state = FinishedClose;
                             }
                         }
-                        _ => return Err(Error::new(Kind::Protocol, "Encountered invalid opcode.")),
                     }
-                } else {
-                    if frame.is_control() {
-                        return Err(Error::new(
-                            Kind::Protocol,
-                            "Encounted fragmented control frame.",
-                        ));
-                    } else {
-                        trace!("Received non-final fragment frame {:?}", frame);
-                        if !self.settings.fragments_grow
-                            && self.settings.fragments_capacity == self.fragments.len()
-                        {
-                            return Err(Error::new(Kind::Capacity, "Exceeded max fragments."));
+                    OpCode::Ping => {
+                        trace!("Received ping frame {:?}", frame);
+                        conn_events.push(ConnEvent::Ping(frame));
+                    }
+                    OpCode::Pong => {
+                        trace!("Received pong frame {:?}", frame);
+                        conn_events.push(ConnEvent::Pong);
+                    }
+                    // last fragment
+                    OpCode::Continue => {
+                        trace!("Received final fragment {:?}", frame);
+                        if let Some(first) = self.fragments.pop_front() {
+                            let size = self.fragments.iter().fold(
+                                first.payload().len() + frame.payload().len(),
+                                |len, frame| len + frame.payload().len(),
+                            );
+                            match first.opcode() {
+                                OpCode::Text => {
+                                    trace!("Constructing text message from fragments: {:?} -> {:?} -> {:?}", first, self.fragments.iter().collect::<Vec<&Frame>>(), frame);
+                                    let mut data = Vec::with_capacity(size);
+                                    data.extend(first.into_data());
+                                    while let Some(frame) = self.fragments.pop_front() {
+                                        data.extend(frame.into_data());
+                                    }
+                                    data.extend(frame.into_data());
+
+                                    let string = String::from_utf8(data)
+                                        .map_err(|err| err.utf8_error())?;
+
+                                    trace!(
+                                        "Calling handler with constructed message: {:?}",
+                                        string
+                                    );
+
+                                    conn_events.push(ConnEvent::Message(Message::text(string)));
+                                }
+                                OpCode::Binary => {
+                                    trace!("Constructing binary message from fragments: {:?} -> {:?} -> {:?}", first, self.fragments.iter().collect::<Vec<&Frame>>(), frame);
+                                    let mut data = Vec::with_capacity(size);
+                                    data.extend(first.into_data());
+
+                                    while let Some(frame) = self.fragments.pop_front() {
+                                        data.extend(frame.into_data());
+                                    }
+
+                                    data.extend(frame.into_data());
+
+                                    trace!(
+                                        "Calling handler with constructed message: {:?}",
+                                        data
+                                    );
+
+                                    conn_events.push(ConnEvent::Message(Message::binary(data)));
+                                }
+                                _ => {
+                                    return Err(Error::new(
+                                        Kind::Protocol,
+                                        "Encounted fragmented control frame.",
+                                    ))
+                                }
+                            }
                         } else {
-                            self.fragments.push_back(frame)
+                            return Err(Error::new(
+                                Kind::Protocol,
+                                "Unable to reconstruct fragmented message. No first frame.",
+                            ));
                         }
+                    }
+                    _ => return Err(Error::new(Kind::Protocol, "Encountered invalid opcode.")),
+                }
+            } else {
+                if frame.is_control() {
+                    return Err(Error::new(Kind::Protocol, "Encounted fragmented control frame."));
+                } else {
+                    trace!("Received non-final fragment frame {:?}", frame);
+                    if !self.settings.fragments_grow
+                        && self.settings.fragments_capacity == self.fragments.len()
+                    {
+                        return Err(Error::new(Kind::Capacity, "Exceeded max fragments."));
+                    } else {
+                        self.fragments.push_back(frame)
                     }
                 }
             }
         }
-        Ok(())
+
+        Ok(conn_events)
     }
 
-    pub fn write(&mut self) -> Result<()> {
+    pub fn write(&mut self) -> Result<Vec<ConnEvent>> {
         if self.socket.is_negotiating() {
             trace!("Performing TLS negotiation on {}.", self.peer_addr());
             self.socket.clear_negotiating()?;
@@ -989,16 +977,16 @@ where
                             // close frame, let's disconnect
                             FinishedClose if self.is_server() => {
                                 self.events = Ready::empty();
-                                return Ok(());
+                                return Ok(Vec::new());
                             }
                             _ => (),
                         }
-                    }
+                   }
                 }
 
                 // Check if there is more to write so that the connection will be rescheduled
                 self.check_events();
-                Ok(())
+                Ok(Vec::new())
             };
 
             if self.socket.is_negotiating() && res.is_ok() {
@@ -1023,89 +1011,92 @@ where
         trace!("Message opcode {:?}", opcode);
         let data = msg.into_data();
 
-        if let Some(frame) = self.handler
-            .on_send_frame(Frame::message(data, opcode, true))?
-        {
-            if frame.payload().len() > self.settings.fragment_size {
-                trace!("Chunking at {:?}.", self.settings.fragment_size);
-                // note this copies the data, so it's actually somewhat expensive to fragment
-                let mut chunks = frame
-                    .payload()
-                    .chunks(self.settings.fragment_size)
-                    .peekable();
-                let chunk = chunks.next().expect("Unable to get initial chunk!");
+        let frame = Frame::message(data, opcode, true);
 
-                let mut first = Frame::message(Vec::from(chunk), opcode, false);
+        // default implementation doesn't allow for reserved bits to be set
+        if frame.has_rsv1() || frame.has_rsv2() || frame.has_rsv3() {
+            panic!(Error::new(Kind::Protocol, "Encountered frame with reserved bits set."));
+        } else if frame.payload().len() > self.settings.fragment_size {
+            
+            trace!("Chunking at {:?}.", self.settings.fragment_size);
+            // note this copies the data, so it's actually somewhat expensive to fragment
+            let mut chunks = frame
+                .payload()
+                .chunks(self.settings.fragment_size)
+                .peekable();
+            let chunk = chunks.next().expect("Unable to get initial chunk!");
 
-                // Match reserved bits from original to keep extension status intact
-                first.set_rsv1(frame.has_rsv1());
-                first.set_rsv2(frame.has_rsv2());
-                first.set_rsv3(frame.has_rsv3());
+            let mut first = Frame::message(Vec::from(chunk), opcode, false);
 
-                self.buffer_frame(first)?;
+            // Match reserved bits from original to keep extension status intact
+            first.set_rsv1(frame.has_rsv1());
+            first.set_rsv2(frame.has_rsv2());
+            first.set_rsv3(frame.has_rsv3());
 
-                while let Some(chunk) = chunks.next() {
-                    if chunks.peek().is_some() {
-                        self.buffer_frame(Frame::message(
-                            Vec::from(chunk),
-                            OpCode::Continue,
-                            false,
-                        ))?;
-                    } else {
-                        self.buffer_frame(Frame::message(
-                            Vec::from(chunk),
-                            OpCode::Continue,
-                            true,
-                        ))?;
-                    }
+            self.buffer_frame(first)?;
+
+            while let Some(chunk) = chunks.next() {
+                if chunks.peek().is_some() {
+                    self.buffer_frame(Frame::message(
+                        Vec::from(chunk),
+                        OpCode::Continue,
+                        false,
+                    ))?;
+                } else {
+                    self.buffer_frame(Frame::message(
+                        Vec::from(chunk),
+                        OpCode::Continue,
+                        true,
+                    ))?;
                 }
-            } else {
-                trace!("Sending unfragmented message frame.");
-                // true means that the message is done
-                self.buffer_frame(frame)?;
             }
-        }
-        self.check_events();
-        Ok(())
-    }
-
-    #[inline]
-    pub fn send_ping(&mut self, data: Vec<u8>) -> Result<()> {
-        if self.state.is_closing() {
-            trace!(
-                "Connection is closing. Ignoring request to send ping {:?} to {}.",
-                data,
-                self.peer_addr()
-            );
-            return Ok(());
-        }
-        trace!("Sending ping to {}.", self.peer_addr());
-
-        if let Some(frame) = self.handler.on_send_frame(Frame::ping(data))? {
+        } else {
+            trace!("Sending unfragmented message frame.");
+            // true means that the message is done
             self.buffer_frame(frame)?;
         }
+        
         self.check_events();
         Ok(())
     }
 
-    #[inline]
-    pub fn send_pong(&mut self, data: Vec<u8>) -> Result<()> {
-        if self.state.is_closing() {
-            trace!(
-                "Connection is closing. Ignoring request to send pong {:?} to {}.",
-                data,
-                self.peer_addr()
-            );
-            return Ok(());
-        }
-        trace!("Sending pong to {}.", self.peer_addr());
+    // #[inline]
+    // pub fn send_ping(&mut self, data: Vec<u8>) -> Result<()> {
+    //     if self.state.is_closing() {
+    //         trace!(
+    //             "Connection is closing. Ignoring request to send ping {:?} to {}.",
+    //             data,
+    //             self.peer_addr()
+    //         );
+    //         return Ok(());
+    //     }
+    //     trace!("Sending ping to {}.", self.peer_addr());
 
-        if let Some(frame) = self.handler.on_send_frame(Frame::pong(data))? {
-            self.buffer_frame(frame)?;
-        }
-        self.check_events();
-        Ok(())
-    }
+    //     if let Some(frame) = self.handler.on_send_frame(Frame::ping(data))? {
+    //         self.buffer_frame(frame)?;
+    //     }
+    //     self.check_events();
+    //     Ok(())
+    // }
+
+    // #[inline]
+    // pub fn send_pong(&mut self, data: Vec<u8>) -> Result<()> {
+    //     if self.state.is_closing() {
+    //         trace!(
+    //             "Connection is closing. Ignoring request to send pong {:?} to {}.",
+    //             data,
+    //             self.peer_addr()
+    //         );
+    //         return Ok(());
+    //     }
+    //     trace!("Sending pong to {}.", self.peer_addr());
+
+    //     if let Some(frame) = self.handler.on_send_frame(Frame::pong(data))? {
+    //         self.buffer_frame(frame)?;
+    //     }
+    //     self.check_events();
+    //     Ok(())
+    // }
 
     #[inline]
     pub fn send_close<R>(&mut self, code: CloseCode, reason: R) -> Result<()>
@@ -1141,9 +1132,12 @@ where
             self.peer_addr()
         );
 
-        if let Some(frame) = self.handler
-            .on_send_frame(Frame::close(code, reason.borrow()))?
-        {
+        let frame = Frame::close(code, reason.borrow());
+
+        // default implementation doesn't allow for reserved bits to be set
+        if frame.has_rsv1() || frame.has_rsv2() || frame.has_rsv3() {
+            panic!(Error::new(Kind::Protocol, "Encountered frame with reserved bits set."));
+        } else {
             self.buffer_frame(frame)?;
         }
 
