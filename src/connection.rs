@@ -2,13 +2,10 @@ use std::borrow::Borrow;
 use std::collections::VecDeque;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::mem::replace;
-use std::net::SocketAddr;
 use std::str::from_utf8;
 
 use mio::tcp::TcpStream;
 use mio::{Ready, Token};
-use mio_extras::timer::Timeout;
-use url;
 
 #[cfg(feature = "ssl")]
 use openssl::ssl::HandshakeError;
@@ -22,7 +19,6 @@ use protocol::{CloseCode, OpCode};
 use result::{Error, Kind, Result};
 use stream::{Stream, TryReadBuf, TryWriteBuf};
 
-use self::Endpoint::*;
 use self::State::*;
 
 use super::Settings;
@@ -38,22 +34,16 @@ pub enum State {
     FinishedClose,
 }
 
-/// A little more semantic than a boolean
-#[derive(Debug, Eq, PartialEq, Clone)]
-pub enum Endpoint {
-    /// Will mask outgoing frames
-    Client(url::Url),
-    /// Won't mask outgoing frames
-    Server,
-}
-
 /// High-level connection events
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ConnEvent {
     NOOP,
     Ping(Frame),
     Pong,
     Message(Message),
+    // Response(),
+    Open(Handshake),
+    Close(CloseCode, String),
 }
 
 impl State {
@@ -87,15 +77,12 @@ pub struct Connection {
     token: Token,
     socket: Stream,
     state: State,
-    endpoint: Endpoint,
     events: Ready,
 
     fragments: VecDeque<Frame>,
 
     in_buffer: Cursor<Vec<u8>>,
     out_buffer: Cursor<Vec<u8>>,
-
-    addresses: Vec<SocketAddr>,
 
     settings: Settings,
     connection_id: u32,
@@ -115,12 +102,10 @@ impl Connection {
                 Cursor::new(Vec::with_capacity(2048)),
                 Cursor::new(Vec::with_capacity(2048)),
             ),
-            endpoint: Endpoint::Server,
             events: Ready::empty(),
             fragments: VecDeque::with_capacity(settings.fragments_capacity),
             in_buffer: Cursor::new(Vec::with_capacity(settings.in_buffer_capacity)),
             out_buffer: Cursor::new(Vec::with_capacity(settings.out_buffer_capacity)),
-            addresses: Vec::new(),
             settings,
             connection_id,
         }
@@ -131,28 +116,10 @@ impl Connection {
         Ok(())
     }
 
-    // pub fn as_client(&mut self, url: url::Url, addrs: Vec<SocketAddr>) -> Result<()> {
-    //     if let Connecting(ref mut req_buf, _) = self.state {
-    //         let req = self.handler.build_request(&url)?;
-    //         self.addresses = addrs;
-    //         self.events.insert(Ready::writable());
-    //         self.endpoint = Endpoint::Client(url);
-    //         req.format(req_buf.get_mut())
-    //     } else {
-    //         Err(Error::new(
-    //             Kind::Internal,
-    //             "Tried to set connection to client while not connecting.",
-    //         ))
-    //     }
-    // }
-
     // #[cfg(any(feature = "ssl", feature = "nativetls"))]
     // pub fn encrypt(&mut self) -> Result<()> {
     //     let sock = self.socket().try_clone()?;
-    //     let ssl_stream = match self.endpoint {
-    //         Server => self.handler.upgrade_ssl_server(sock),
-    //         Client(ref url) => self.handler.upgrade_ssl_client(sock, url),
-    //     };
+    //     let ssl_stream = self.handler.upgrade_ssl_server(sock);
 
     //     match ssl_stream {
     //         Ok(stream) => {
@@ -209,146 +176,15 @@ impl Connection {
         }
     }
 
-    // Resetting may be necessary in order to try all possible addresses for a server
-    // #[cfg(any(feature = "ssl", feature = "nativetls"))]
-    // pub fn reset(&mut self) -> Result<()> {
-    //     // if self.is_client() {
-    //     if let Client(ref url) = self.endpoint {
-    //         if let Connecting(ref mut req, ref mut res) = self.state {
-    //             req.set_position(0);
-    //             res.set_position(0);
-    //             self.events.remove(Ready::readable());
-    //             self.events.insert(Ready::writable());
-
-    //             if let Some(ref addr) = self.addresses.pop() {
-    //                 let sock = TcpStream::connect(addr)?;
-    //                 if self.socket.is_tls() {
-    //                     let ssl_stream = self.handler.upgrade_ssl_client(sock, url);
-    //                     match ssl_stream {
-    //                         Ok(stream) => {
-    //                             self.socket = Stream::tls_live(stream);
-    //                             Ok(())
-    //                         }
-    //                         #[cfg(feature = "ssl")]
-    //                         Err(Error {
-    //                             kind: Kind::SslHandshake(handshake_err),
-    //                             details,
-    //                         }) => match handshake_err {
-    //                             HandshakeError::SetupFailure(_) => {
-    //                                 Err(Error::new(Kind::SslHandshake(handshake_err), details))
-    //                             }
-    //                             HandshakeError::Failure(mid) | HandshakeError::Interrupted(mid) => {
-    //                                 self.socket = Stream::tls(mid);
-    //                                 Ok(())
-    //                             }
-    //                         },
-    //                         #[cfg(feature = "nativetls")]
-    //                         Err(Error {
-    //                             kind: Kind::SslHandshake(handshake_err),
-    //                             details,
-    //                         }) => match handshake_err {
-    //                             HandshakeError::Failure(_) => {
-    //                                 Err(Error::new(Kind::SslHandshake(handshake_err), details))
-    //                             }
-    //                             HandshakeError::Interrupted(mid) => {
-    //                                 self.socket = Stream::tls(mid);
-    //                                 Ok(())
-    //                             }
-    //                         },
-    //                         Err(e) => Err(e),
-    //                     }
-    //                 } else {
-    //                     self.socket = Stream::tcp(sock);
-    //                     Ok(())
-    //                 }
-    //             } else {
-    //                 if self.settings.panic_on_new_connection {
-    //                     panic!("Unable to connect to server.");
-    //                 }
-    //                 Err(Error::new(Kind::Internal, "Exhausted possible addresses."))
-    //             }
-    //         } else {
-    //             Err(Error::new(
-    //                 Kind::Internal,
-    //                 "Unable to reset client connection because it is active.",
-    //             ))
-    //         }
-    //     } else {
-    //         Err(Error::new(
-    //             Kind::Internal,
-    //             "Server connections cannot be reset.",
-    //         ))
-    //     }
-    // }
-
-    // #[cfg(not(any(feature = "ssl", feature = "nativetls")))]
-    // pub fn reset(&mut self) -> Result<()> {
-    //     if self.is_client() {
-    //         if let Connecting(ref mut req, ref mut res) = self.state {
-    //             req.set_position(0);
-    //             res.set_position(0);
-    //             self.events.remove(Ready::readable());
-    //             self.events.insert(Ready::writable());
-
-    //             if let Some(ref addr) = self.addresses.pop() {
-    //                 let sock = TcpStream::connect(addr)?;
-    //                 self.socket = Stream::tcp(sock);
-    //                 Ok(())
-    //             } else {
-    //                 if self.settings.panic_on_new_connection {
-    //                     panic!("Unable to connect to server.");
-    //                 }
-    //                 Err(Error::new(Kind::Internal, "Exhausted possible addresses."))
-    //             }
-    //         } else {
-    //             Err(Error::new(
-    //                 Kind::Internal,
-    //                 "Unable to reset client connection because it is active.",
-    //             ))
-    //         }
-    //     } else {
-    //         Err(Error::new(
-    //             Kind::Internal,
-    //             "Server connections cannot be reset.",
-    //         ))
-    //     }
-    // }
-
     pub fn events(&self) -> Ready {
         self.events
     }
 
-    pub fn is_client(&self) -> bool {
-        match self.endpoint {
-            Client(_) => true,
-            Server => false,
-        }
+    pub fn shutdown(&mut self) -> Result<()> {
+        self.send_close(CloseCode::Away, "Shutting down.")?;
+        self.disconnect();
+        Ok(())
     }
-
-    pub fn is_server(&self) -> bool {
-        match self.endpoint {
-            Client(_) => false,
-            Server => true,
-        }
-    }
-
-    // pub fn shutdown(&mut self) {
-    //     self.handler.on_shutdown();
-    //     if let Err(err) = self.send_close(CloseCode::Away, "Shutting down.") {
-    //         self.handler.on_error(err);
-    //         self.disconnect()
-    //     }
-    // }
-
-    // #[inline]
-    // pub fn new_timeout(&mut self, event: Token, timeout: Timeout) -> Result<()> {
-    //     self.handler.on_new_timeout(event, timeout)
-    // }
-
-    // #[inline]
-    // pub fn timeout_triggered(&mut self, event: Token) -> Result<()> {
-    //     self.handler.on_timeout(event)
-    // }
 
     pub fn error(&mut self, err: Error) {
         match self.state {
@@ -358,36 +194,28 @@ impl Connection {
                 Kind::Io(_) => { self.events = Ready::empty(); }
                 Kind::Protocol => {
                     let msg = err.to_string();
-                    if let Server = self.endpoint {
-                        res.get_mut().clear();
-                        if let Err(err) =
-                            write!(res.get_mut(), "HTTP/1.1 400 Bad Request\r\n\r\n{}", msg)
-                        {
-                            self.events = Ready::empty();
-                        } else {
-                            self.events.remove(Ready::readable());
-                            self.events.insert(Ready::writable());
-                        }
-                    } else {
+                    res.get_mut().clear();
+                    if let Err(err) =
+                        write!(res.get_mut(), "HTTP/1.1 400 Bad Request\r\n\r\n{}", msg)
+                    {
                         self.events = Ready::empty();
+                    } else {
+                        self.events.remove(Ready::readable());
+                        self.events.insert(Ready::writable());
                     }
                 }
                 _ => {
                     let msg = err.to_string();
-                    if let Server = self.endpoint {
-                        res.get_mut().clear();
-                        if let Err(err) = write!(
-                            res.get_mut(),
-                            "HTTP/1.1 500 Internal Server Error\r\n\r\n{}",
-                            msg
-                        ) {
-                            self.events = Ready::empty();
-                        } else {
-                            self.events.remove(Ready::readable());
-                            self.events.insert(Ready::writable());
-                        }
-                    } else {
+                    res.get_mut().clear();
+                    if let Err(err) = write!(
+                        res.get_mut(),
+                        "HTTP/1.1 500 Internal Server Error\r\n\r\n{}",
+                        msg
+                    ) {
                         self.events = Ready::empty();
+                    } else {
+                        self.events.remove(Ready::readable());
+                        self.events.insert(Ready::writable());
                     }
                 }
             },
@@ -469,36 +297,16 @@ impl Connection {
     //     self.handler
     // }
 
-    fn write_handshake(&mut self) -> Result<Vec<ConnEvent>> {
+    fn write_handshake(&mut self, conn_events: &mut Vec<ConnEvent>) -> Result<()> {
         if let Connecting(ref mut req, ref mut res) = self.state {
-            match self.endpoint {
-                Server => {
-                    let mut done = false;
-                    if self.socket.try_write_buf(res)?.is_some() {
-                        if res.position() as usize == res.get_ref().len() {
-                            done = true
-                        }
-                    }
-                    if !done {
-                        return Ok(Vec::new());
-                    }
+            let mut done = false;
+            if self.socket.try_write_buf(res)?.is_some() {
+                if res.position() as usize == res.get_ref().len() {
+                    done = true
                 }
-                Client(_) => {
-                    if self.socket.try_write_buf(req)?.is_some() {
-                        if req.position() as usize == req.get_ref().len() {
-                            trace!(
-                                "Finished writing handshake request to {}",
-                                self.socket
-                                    .peer_addr()
-                                    .map(|addr| addr.to_string())
-                                    .unwrap_or_else(|_| "UNKNOWN".into())
-                            );
-                            self.events.insert(Ready::readable());
-                            self.events.remove(Ready::writable());
-                        }
-                    }
-                    return Ok(Vec::new());
-                }
+            }
+            if !done {
+                return Ok(());
             }
         }
 
@@ -515,7 +323,7 @@ impl Connection {
                     // parse. We don't call disconnect here because `on_open` hasn't been called yet.
                     self.state = FinishedClose;
                     self.events = Ready::empty();
-                    return Ok(Vec::new());
+                    return Ok(());
                 }
             };
 
@@ -528,18 +336,22 @@ impl Connection {
 
             if response.status() != 101 {
                 self.events = Ready::empty();
-                return Ok(Vec::new());
+                return Ok(());
             } else {
-                // self.handler.on_open(Handshake {
-                //     request,
-                //     response,
-                //     peer_addr: self.socket.peer_addr().ok(),
-                //     local_addr: self.socket.local_addr().ok(),
-                // })?;
                 debug!("Connection to {} is now open.", self.peer_addr());
+                
+                conn_events.push(ConnEvent::Open(
+                    Handshake {
+                        request,
+                        response,
+                        peer_addr: self.socket.peer_addr().ok(),
+                        local_addr: self.socket.local_addr().ok(),
+                    }
+                ));
+                
                 self.events.insert(Ready::readable());
                 self.check_events();
-                return Ok(Vec::new());
+                return Ok(());
             }
         } else {
             Err(Error::new(
@@ -549,44 +361,23 @@ impl Connection {
         }
     }
 
-    fn read_handshake(&mut self) -> Result<Vec<ConnEvent>> {
+    fn read_handshake(&mut self, conn_events: &mut Vec<ConnEvent>) -> Result<()> {
         if let Connecting(ref mut req, ref mut res) = self.state {
-            match self.endpoint {
-                Server => {
-                    if let Some(read) = self.socket.try_read_buf(req.get_mut())? {
-                        if read == 0 {
-                            self.events = Ready::empty();
-                            return Ok(Vec::new());
-                        }
-                        if let Some(ref request) = Request::parse(req.get_ref())? {
-                            trace!("Handshake request received: \n{}", request);
-                            let response = Response::from_request(request).unwrap();
-                            response.format(res.get_mut())?;
-                            self.events.remove(Ready::readable());
-                            self.events.insert(Ready::writable());
-                        }
-                    }
-                    return Ok(Vec::new());
+            if let Some(read) = self.socket.try_read_buf(req.get_mut())? {
+                if read == 0 {
+                    self.events = Ready::empty();
+                    return Ok(());
                 }
-                Client(_) => {
-                    // if self.socket.try_read_buf(res.get_mut())?.is_some() {
-                    //     // TODO: see if this can be optimized with drain
-                    //     let end = {
-                    //         let data = res.get_ref();
-                    //         let end = data.iter()
-                    //             .enumerate()
-                    //             .take_while(|&(ind, _)| !data[..ind].ends_with(b"\r\n\r\n"))
-                    //             .count();
-                    //         if !data[..end].ends_with(b"\r\n\r\n") {
-                    //             return Ok(ConnEvent::NOOP);
-                    //         }
-                    //         self.in_buffer.get_mut().extend(&data[end..]);
-                    //         end
-                    //     };
-                    //     res.get_mut().truncate(end);
-                    // }
+                if let Some(ref request) = Request::parse(req.get_ref())? {
+                    trace!("Handshake request received: \n{}", request);
+                    let response = Response::from_request(request).unwrap();
+                    response.format(res.get_mut())?;
+                    self.events.remove(Ready::readable());
+                    self.events.insert(Ready::writable());
                 }
             }
+            
+            return Ok(());
         }
 
         if let Connecting(ref req, ref res) = replace(&mut self.state, Open) {
@@ -615,7 +406,7 @@ impl Connection {
                 if response.status() != 301 && response.status() != 302 {
                     return Err(Error::new(Kind::Protocol, "Handshake failed."));
                 } else {
-                    return Ok(Vec::new());
+                    return Ok(());
                 }
             }
 
@@ -633,48 +424,45 @@ impl Connection {
                 }
             }
 
-            // self.handler.on_response(&response)?;
-            // self.handler.on_open(Handshake {
-            //     request,
-            //     response,
-            //     peer_addr: self.socket.peer_addr().ok(),
-            //     local_addr: self.socket.local_addr().ok(),
-            // })?;
+            // conn_events.push(ConnEvent::Response());
+            conn_events.push(ConnEvent::Open(
+                Handshake {
+                    request,
+                    response,
+                    peer_addr: self.socket.peer_addr().ok(),
+                    local_addr: self.socket.local_addr().ok(),
+                }
+            ));
 
             // check to see if there is anything to read already
-            let conn_events = if !self.in_buffer.get_ref().is_empty() {
-                self.read_frames().unwrap()
-            } else {
-                Vec::new()
-            };
+            if !self.in_buffer.get_ref().is_empty() {
+                self.read_frames(conn_events)?;
+            }
 
             self.check_events();
-            return Ok(conn_events);
+            return Ok(());
         }
+
         Err(Error::new(
             Kind::Internal,
             "Tried to read WebSocket handshake while not in connecting state!",
         ))
     }
 
-    pub fn read(&mut self) -> Result<Vec<ConnEvent>> {
+    pub fn read(&mut self, conn_events: &mut Vec<ConnEvent>) -> Result<()> {
         if self.socket.is_negotiating() {
             trace!("Performing TLS negotiation on {}.", self.peer_addr());
             self.socket.clear_negotiating()?;
-            self.write()
+            self.write(conn_events)
         } else {
             let res = if self.state.is_connecting() {
                 trace!("Ready to read handshake from {}.", self.peer_addr());
-                self.read_handshake()
+                self.read_handshake(conn_events)
             } else {
-                let mut conn_events = Vec::with_capacity(8);
-                
                 trace!("Ready to read messages from {}.", self.peer_addr());
                 while let Some(len) = self.buffer_in()? {
-                    match self.read_frames() {
-                        Err(err) => panic!(err),
-                        Ok(mut events) => conn_events.append(&mut events),
-                    }
+                    self.read_frames(conn_events)?;
+
                     if len == 0 {
                         if self.events.is_writable() {
                             self.events.remove(Ready::readable());
@@ -685,7 +473,7 @@ impl Connection {
                     }
                 }
                 
-                Ok(conn_events)
+                Ok(())
             };
 
             if self.socket.is_negotiating() && res.is_ok() {
@@ -696,10 +484,7 @@ impl Connection {
         }
     }
 
-    fn read_frames(&mut self) -> Result<Vec<ConnEvent>> {
-
-        let mut conn_events = Vec::with_capacity(2);
-        
+    fn read_frames(&mut self, conn_events: &mut Vec<ConnEvent>) -> Result<()> {
         while let Some(mut frame) = Frame::parse(&mut self.in_buffer)? {
             match self.state {
                 // Ignore data received after receiving close frame
@@ -708,20 +493,11 @@ impl Connection {
             }
 
             if self.settings.masking_strict {
-                if frame.is_masked() {
-                    if self.is_client() {
-                        return Err(Error::new(
-                            Kind::Protocol,
-                            "Received masked frame from a server endpoint.",
-                        ));
-                    }
-                } else {
-                    if self.is_server() {
-                        return Err(Error::new(
-                            Kind::Protocol,
-                            "Received unmasked frame from a client endpoint.",
-                        ));
-                    }
+                if !frame.is_masked() {
+                    return Err(Error::new(
+                        Kind::Protocol,
+                        "Received unmasked frame from a client endpoint.",
+                    ));
                 }
             }
 
@@ -761,13 +537,8 @@ impl Connection {
                         trace!("Received close frame {:?}", frame);
                         // Closing handshake
                         if self.state.is_closing() {
-                            if self.is_server() {
-                                // Finished handshake, disconnect server side
-                                self.events = Ready::empty()
-                            } else {
-                                // We are a client, so we wait for the server to close the
-                                // connection
-                            }
+                            // Finished handshake, disconnect server side
+                            self.events = Ready::empty()
                         } else {
                             // Starting handshake, will send the responding close frame
                             self.state = RespondingClose;
@@ -806,10 +577,10 @@ impl Connection {
                             }
                             let has_reason = {
                                 if let Ok(reason) = from_utf8(&data.get_ref()[2..]) {
-                                    // self.handler.on_close(named, reason); // note reason may be an empty string
+                                    conn_events.push(ConnEvent::Close(named, reason.to_string()));
                                     true
                                 } else {
-                                    // self.handler.on_close(named, "");
+                                    conn_events.push(ConnEvent::Close(named, "".to_string()));
                                     false
                                 }
                             };
@@ -855,7 +626,7 @@ impl Connection {
                             // protocol, so we don't trigger an error.
                             // "If there is no such data in the Close control frame,
                             // _The WebSocket Connection Close Reason_ is the empty string."
-                            // self.handler.on_close(CloseCode::Status, "");
+                            conn_events.push(ConnEvent::Close(CloseCode::Status, "".to_string()));
                             if !self.state.is_closing() {
                                 self.send_close(CloseCode::Empty, "")?;
                             } else {
@@ -949,18 +720,18 @@ impl Connection {
             }
         }
 
-        Ok(conn_events)
+        Ok(())
     }
 
-    pub fn write(&mut self) -> Result<Vec<ConnEvent>> {
+    pub fn write(&mut self, conn_events: &mut Vec<ConnEvent>) -> Result<()> {
         if self.socket.is_negotiating() {
             trace!("Performing TLS negotiation on {}.", self.peer_addr());
             self.socket.clear_negotiating()?;
-            self.read()
+            self.read(conn_events)
         } else {
             let res = if self.state.is_connecting() {
                 trace!("Ready to write handshake to {}.", self.peer_addr());
-                self.write_handshake()
+                self.write_handshake(conn_events)
             } else {
                 trace!("Ready to write messages to {}.", self.peer_addr());
 
@@ -975,9 +746,9 @@ impl Connection {
                         match self.state {
                             // we are are a server that is closing and just wrote out our confirming
                             // close frame, let's disconnect
-                            FinishedClose if self.is_server() => {
+                            FinishedClose => {
                                 self.events = Ready::empty();
-                                return Ok(Vec::new());
+                                return Ok(());
                             }
                             _ => (),
                         }
@@ -986,13 +757,14 @@ impl Connection {
 
                 // Check if there is more to write so that the connection will be rescheduled
                 self.check_events();
-                Ok(Vec::new())
+                Ok(())
             };
 
             if self.socket.is_negotiating() && res.is_ok() {
                 self.events.remove(Ready::writable());
                 self.events.insert(Ready::readable());
             }
+            
             res
         }
     }
@@ -1158,10 +930,6 @@ impl Connection {
 
     fn buffer_frame(&mut self, mut frame: Frame) -> Result<()> {
         self.check_buffer_out(&frame)?;
-
-        if self.is_client() {
-            frame.set_mask();
-        }
 
         trace!("Buffering frame to {}:\n{}", self.peer_addr(), frame);
 

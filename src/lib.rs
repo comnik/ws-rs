@@ -47,10 +47,7 @@ pub use protocol::{CloseCode, OpCode};
 pub use result::Kind as ErrorKind;
 pub use result::{Error, Result};
 
-use std::borrow::Borrow;
 use std::default::Default;
-use std::fmt;
-use std::net::{SocketAddr, ToSocketAddrs};
 
 /// WebSocket settings
 #[derive(Debug, Clone, Copy)]
